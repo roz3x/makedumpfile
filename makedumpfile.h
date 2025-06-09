@@ -1430,6 +1430,7 @@ struct page_flag {
 	char ready;
 	short index;
 	struct page_flag *next;
+
 };
 
 struct page_data
@@ -1446,6 +1447,9 @@ struct thread_args {
 	struct cycle *cycle;
 	struct page_data *page_data_buf;
 	struct page_flag *page_flag_buf;
+	mdf_pfn_t start_pfn, end_pfn; 
+	int completed;
+	int local_dumped_count;
 };
 
 /*
@@ -2581,8 +2585,8 @@ is_dumpable_file(struct dump_bitmap *bitmap, mdf_pfn_t pfn)
 
 		rcode = read(bitmap->fd, bitmap->buf, BUFSIZE_BITMAP);
 		if (rcode != BUFSIZE_BITMAP)
-			ERRMSG("Can't read the bitmap(%s). %s\n",
-				bitmap->file_name, strerror(errno));
+			ERRMSG("Can't read the bitmap(%s). %lld %s\n",
+				bitmap->file_name, pfn, strerror(errno));
 		if (pfn == 0)
 			bitmap->no_block = 0;
 		else

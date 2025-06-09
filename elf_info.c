@@ -648,17 +648,33 @@ closest_pt_load(unsigned long long paddr, unsigned long distance)
 
 	bestdist = distance;
 	bestidx = -1;
+	// if (paddr == 3677564928LL ) { 
+	// 	for (int k = 0; k < num_pt_loads ; ++k ) { 
+	// 		pls = &pt_loads[k];
+	// 		printf("start : %lld\n",pls->phys_start );
+	// 	}
+	// }
 	for (i = 0; i < num_pt_loads; ++i) {
 		pls = &pt_loads[i];
+
 		if (paddr >= pls->phys_end)
 			continue;
-		if (paddr >= pls->phys_start)
+		if (paddr >= pls->phys_start){
+			// printf("input : %lld, output : %lld\n", paddr, 
+			// 	pls->phys_start);
 			return i;	/* Exact match */
+		}
 		if (bestdist > pls->phys_start - paddr) {
 			bestdist = pls->phys_start - paddr;
 			bestidx = i;
 		}
 	}
+		printf("this is error case, this should not happen \n");
+		for (int k = 0; k < num_pt_loads ; ++k ) { 
+			pls = &pt_loads[k];
+			printf("start : %lld end : %lld\n",pls->phys_start, pls->phys_end );
+		}
+	// printf("input : %lld , output : %lld\n", pt_loads[bestidx].phys_end);
 	return bestidx;
 }
 

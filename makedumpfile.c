@@ -774,20 +774,20 @@ readpage_elf(unsigned long long paddr, void *bufptr)
 }
 
 static int
-readpage_elf_parallel(int fd_memory, unsigned long long paddr, void *bufptr)
+readpage_elf_parallel(int fd_memory, unsigned long long paddr, void *bufptr , mdf_pfn_t pfn )
 {
 	int idx;
 	off_t offset, size;
 	void *p, *endp;
 	unsigned long long phys_start, phys_end;
-
 	p = bufptr;
 	endp = p + info->page_size;
 	while (p < endp) {
 		idx = closest_pt_load(paddr, endp - p);
-		if (idx < 0)
+		if (idx < 0){
+			printf("this case is happening : %ld\n", paddr );
 			break;
-
+		}
 		get_pt_load_extents(idx, &phys_start, &phys_end, &offset, &size);
 		if (phys_start > paddr) {
 			memset(p, 0, phys_start - paddr);
@@ -820,6 +820,7 @@ readpage_elf_parallel(int fd_memory, unsigned long long paddr, void *bufptr)
 	}
 
 	if (p == bufptr) {
+		printf("error: %ld\n", pfn);
 		ERRMSG("Attempt to read non-existent page at 0x%llx.\n",
 		       paddr);
 		return FALSE;
@@ -8119,7 +8120,7 @@ read_pfn_parallel(int fd_memory, mdf_pfn_t pfn, unsigned char *buf,
 		if (mapbuf) {
 			memcpy(buf, mapbuf, info->page_size);
 		} else {
-			if (!readpage_elf_parallel(fd_memory, pgaddr, buf)) {
+			if (!readpage_elf_parallel(fd_memory, pgaddr, buf, pfn)) {
 				ERRMSG("Can't get the page data.\n");
 				return FALSE;
 			}
@@ -8549,6 +8550,7 @@ cleanup_mutex(void *mutex) {
 	pthread_mutex_unlock(mutex);
 }
 
+
 void *
 kdump_thread_function_cyclic(void *arg) {
 	void *retval = PTHREAD_FAIL;
@@ -8607,6 +8609,11 @@ kdump_thread_function_cyclic(void *arg) {
 	 * unfiltered zero page will only take a page_flag_buf
 	 * unfiltered non-zero page will take a page_flag_buf and a page_data_buf
 	 */
+	int local_start_pfn = kdump_thread_args->start_pfn;
+	pfn = local_start_pfn ;
+	int last_dumped = -1;
+	printf("kdump_thread_args->start_pfn: %lld kdump_thread_args->end_pfn: %lld\n", kdump_thread_args->start_pfn , kdump_thread_args->end_pfn);
+	int this_thread_local_count_dumped = 0;
 	while (pfn < cycle->end_pfn) {
 		buf_ready = FALSE;
 
@@ -8625,6 +8632,7 @@ kdump_thread_function_cyclic(void *arg) {
 				continue;
 
 			/* get next dumpable pfn */
+			#ifndef SHIVANG
 			pthread_mutex_lock(&info->current_pfn_mutex);
 			for (pfn = info->current_pfn; pfn < cycle->end_pfn; pfn++) {
 				dumpable = is_dumpable(
@@ -8634,16 +8642,50 @@ kdump_thread_function_cyclic(void *arg) {
 				if (dumpable)
 					break;
 			}
+			printf("info->current_pfn: %lld\n",info->current_pfn );
 			info->current_pfn = pfn + 1;
+			#else
+			while( pfn < kdump_thread_args->end_pfn  ) {
+				if (pfn == last_dumped )
+					pfn++;
+				
+				dumpable = is_dumpable(
+					info->fd_bitmap >= 0 ? &bitmap_parallel : info->bitmap2,
+					pfn,
+					cycle);
+				if (dumpable) { 
+					last_dumped = pfn;
+					break;
+				}
 
+				pfn++;
+			}
+			if ( pfn >= kdump_thread_args->end_pfn) {
+				sem_post(&info->page_flag_buf_sem);
+				kdump_thread_args->completed = 1;
+				printf("%d setting \n", this_thread_local_count_dumped);
+				kdump_thread_args->local_dumped_count = this_thread_local_count_dumped;
+
+				info->current_pfn = cycle->end_pfn;
+				page_data_buf[index].used = FALSE;
+				printf(" %d thread returned\n", kdump_thread_args->thread_num);
+				pthread_exit(retval);
+			}
+			this_thread_local_count_dumped++;
+			printf("current_pfn : %lld,local_start_pfn : %lld end: %lld\n",
+					 pfn, local_start_pfn, kdump_thread_args->end_pfn);
+			#endif
 			page_flag_buf->pfn = pfn;
 			page_flag_buf->ready = FLAG_FILLING;
-			pthread_mutex_unlock(&info->current_pfn_mutex);
+			#ifndef SHIVANG
+				pthread_mutex_unlock(&info->current_pfn_mutex);
+			#endif
 			sem_post(&info->page_flag_buf_sem);
 
 			if (pfn >= cycle->end_pfn) {
 				info->current_pfn = cycle->end_pfn;
 				page_data_buf[index].used = FALSE;
+				pthread_exit(retval);
 				break;
 			}
 
@@ -8810,6 +8852,10 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 	pthread_mutex_init(&info->page_data_mutex, NULL);
 	sem_init(&info->page_flag_buf_sem, 0, 0);
 
+
+	mdf_pfn_t pfn_stride = (end_pfn - start_pfn) / info->num_threads;
+	mdf_pfn_t iterator_pfn = start_pfn;
+
 	for (i = 0; i < page_buf_num; i++)
 		page_data_buf[i].used = FALSE;
 
@@ -8819,6 +8865,15 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 		kdump_thread_args[i].page_data_buf = page_data_buf;
 		kdump_thread_args[i].page_flag_buf = info->page_flag_buf[i];
 		kdump_thread_args[i].cycle = cycle;
+
+		kdump_thread_args[i].start_pfn = iterator_pfn;
+		kdump_thread_args[i].end_pfn = 
+			(i == info->num_threads - 1) ? 
+				end_pfn - 1
+				: iterator_pfn + pfn_stride;
+		kdump_thread_args[i].completed = 0;
+		kdump_thread_args[i].local_dumped_count = 0;
+		iterator_pfn += pfn_stride;
 
 		res = pthread_create(threads[i], NULL,
 				     kdump_thread_function_cyclic,
@@ -8830,7 +8885,6 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 		}
 	}
 
-	end_count = 0;
 	while (1) {
 		consuming = 0;
 
@@ -8846,6 +8900,7 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 		clock_gettime(CLOCK_MONOTONIC, &last);
 		while (1) {
 			current_pfn = end_pfn;
+			end_count = 0;
 
 			/*
 			 * page_flag_buf is in circular linked list.
@@ -8855,8 +8910,12 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 			 * current_pfn is used for recording the value of pfn when checking the pfn.
 			 */
 			for (i = 0; i < info->num_threads; i++) {
-				if (info->page_flag_buf[i]->ready == FLAG_UNUSED)
+				if ( kdump_thread_args[i].completed ) 
+					end_count++;
+
+				if (info->page_flag_buf[i]->ready == FLAG_UNUSED)  {
 					continue;
+				}
 				temp_pfn = info->page_flag_buf[i]->pfn;
 
 				/*
@@ -8878,9 +8937,13 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 			/*
 			 * If all the threads have reached the end, we will finish writing.
 			 */
-			if (end_count >= info->num_threads)
+			// printf("end_count : %d\n", end_count);
+			if (end_count >= info->num_threads){
+				for(int k = 0; k < info->num_threads ; k++) { 
+					printf("%d -> %d\n", k , kdump_thread_args[k].local_dumped_count);
+				}
 				goto finish;
-
+			}
 			/*
 			 * If the page_flag_buf is not ready, the pfn recorded may be changed.
 			 * So we should recheck.
