@@ -35,7 +35,9 @@ struct array_table	array_table;
 struct number_table	number_table;
 struct srcfile_table	srcfile_table;
 struct save_control	sc;
-
+void shivang_add_pfn(mdf_pfn_t );
+void add_original_pfn(mdf_pfn_t );
+int shivang_binary_serach(mdf_pfn_t );
 struct vm_table		vt = { 0 };
 struct DumpInfo		*info = NULL;
 struct SplitBlock		*splitblock = NULL;
@@ -1065,7 +1067,6 @@ readmem(int type_addr, unsigned long long addr, void *bufptr, size_t size)
 	unsigned long long pgaddr;
 	void *pgbuf;
 	struct cache_entry *cached;
-
 next_page:
 	switch (type_addr) {
 	case VADDR:
@@ -7968,9 +7969,12 @@ get_num_dumpable_cyclic_single(void)
 				return FALSE;
 		}
 
-		for(pfn=cycle.start_pfn; pfn<cycle.end_pfn; pfn++)
-			if (is_dumpable(info->bitmap2, pfn, &cycle))
+		for(pfn=cycle.start_pfn; pfn<cycle.end_pfn; pfn++) {
+			if (is_dumpable(info->bitmap2, pfn, &cycle)) {
+				add_original_pfn(pfn);
 				num_dumpable++;
+			}
+		}
 	}
 
 	return num_dumpable;
@@ -8648,12 +8652,11 @@ kdump_thread_function_cyclic(void *arg) {
 			while( pfn < kdump_thread_args->end_pfn  ) {
 				if (pfn == last_dumped )
 					pfn++;
-				
 				dumpable = is_dumpable(
 					info->fd_bitmap >= 0 ? &bitmap_parallel : info->bitmap2,
 					pfn,
 					cycle);
-				if (dumpable) { 
+				if (dumpable) {
 					last_dumped = pfn;
 					break;
 				}
@@ -8672,8 +8675,9 @@ kdump_thread_function_cyclic(void *arg) {
 				pthread_exit(retval);
 			}
 			this_thread_local_count_dumped++;
-			printf("current_pfn : %lld,local_start_pfn : %lld end: %lld\n",
-					 pfn, local_start_pfn, kdump_thread_args->end_pfn);
+			shivang_add_pfn(pfn);
+//			printf("current_pfn : %lld,local_start_pfn : %lld end: %lld\n",
+//					 pfn, local_start_pfn, kdump_thread_args->end_pfn);
 			#endif
 			page_flag_buf->pfn = pfn;
 			page_flag_buf->ready = FLAG_FILLING;
@@ -8786,6 +8790,78 @@ fail:
 	pthread_exit(retval);
 }
 
+pthread_mutex_t shivang_serializer_lock = PTHREAD_MUTEX_INITIALIZER;
+static int shivang_counter = 0;
+mdf_pfn_t* shivang_data = NULL;
+int data_sz = 0;
+int data_cap = 0;
+
+int max(int a, int b) { return a > b ? a : b ; }
+int min(int a, int b) { return a > b ? b : a ; }
+
+
+struct vector {
+	mdf_pfn_t* shivang_data;
+	int data_sz;
+	int data_cap;
+} collected , original;
+
+void vector_push_back(struct vector *vec , mdf_pfn_t pfn) {
+	if ( vec->shivang_data == NULL ) {
+		vec->data_sz = 0;
+		vec->shivang_data = malloc(16 * sizeof(mdf_pfn_t));
+		vec->data_cap = 16;
+	}
+	else if ( vec->data_sz  > vec->data_cap / 2 ) {
+		vec->data_cap *= 2;
+		vec->shivang_data = realloc(vec->shivang_data,
+			vec->data_cap * sizeof(mdf_pfn_t));
+	}
+	vec->shivang_data[vec->data_sz++] = pfn;
+}
+
+void add_original_pfn(mdf_pfn_t pfn) {
+	vector_push_back(&original, pfn);
+}
+/* just returns wheather its found or not ? */
+int shivang_binary_serach(mdf_pfn_t a) {
+	if ( a < shivang_data[0] ) return 0;
+	if ( a > shivang_data[data_sz-1] ) return 0;
+	int L = 0, R = data_sz;
+	while (L < R -1 ) {
+		int mid = L + (R - L) / 2;
+		if(shivang_data[mid] <= a) {
+			 L = mid;
+		} else {
+			 R = mid;
+		}
+	}
+	return shivang_data[L] == a;
+}
+
+int cmp_mdf_pfn(const void *a1 , const void* b1) {
+	const mdf_pfn_t *a = a1;
+	const mdf_pfn_t *b = b1;
+	if ( *a == *b ) return 0;
+	if ( *a < *b ) return -1;
+	return 1;
+
+}
+void shivang_add_pfn(mdf_pfn_t pfn) {
+	pthread_mutex_lock(&shivang_serializer_lock);
+		if ( shivang_data == NULL ) {
+			data_sz = 0;
+			shivang_data = malloc(16 * sizeof(mdf_pfn_t));
+			data_cap = 16;
+		}
+		else if ( data_sz  > data_cap / 2 ) {
+			data_cap *= 2;
+			shivang_data = realloc(shivang_data, data_cap * sizeof(mdf_pfn_t));
+		}
+		shivang_data[data_sz++] = pfn;
+	pthread_mutex_unlock(&shivang_serializer_lock);
+}
+
 int
 write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 				  struct cache_data *cd_page,
@@ -8867,9 +8943,9 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 		kdump_thread_args[i].cycle = cycle;
 
 		kdump_thread_args[i].start_pfn = iterator_pfn;
-		kdump_thread_args[i].end_pfn = 
-			(i == info->num_threads - 1) ? 
-				end_pfn - 1
+		kdump_thread_args[i].end_pfn =
+			(i == info->num_threads - 1) ?
+				end_pfn
 				: iterator_pfn + pfn_stride;
 		kdump_thread_args[i].completed = 0;
 		kdump_thread_args[i].local_dumped_count = 0;
@@ -8910,7 +8986,7 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 			 * current_pfn is used for recording the value of pfn when checking the pfn.
 			 */
 			for (i = 0; i < info->num_threads; i++) {
-				if ( kdump_thread_args[i].completed ) 
+				if ( kdump_thread_args[i].completed )
 					end_count++;
 
 				if (info->page_flag_buf[i]->ready == FLAG_UNUSED)  {
@@ -8939,9 +9015,40 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 			 */
 			// printf("end_count : %d\n", end_count);
 			if (end_count >= info->num_threads){
-				for(int k = 0; k < info->num_threads ; k++) { 
-					printf("%d -> %d\n", k , kdump_thread_args[k].local_dumped_count);
+				//for (int k = 0 ; k < data_sz; k++) {
+				//	printf("%ld\n", shivang_data[k]);
+				//}
+				qsort(shivang_data, data_sz, sizeof(mdf_pfn_t), cmp_mdf_pfn);
+
+				//for(int k = 0; k < info->num_threads ; k++) {
+				//	printf("%d -> %d\n", k , kdump_thread_args[k].local_dumped_count);
+				//}
+
+				//for (int k = 0 ; k <  data_sz; k++) {
+				//	printf("%lld\n", shivang_data[k]);
+				//}
+
+				for (mdf_pfn_t j = start_pfn; j < 0xffLL; j++) {
+					int d = is_dumpable(
+						info->bitmap2,
+						shivang_data[j],
+						cycle);
+					if (d) {
+						int found = shivang_binary_serach(j);
+						if ( ! found) {
+							// printf("missing page : %lld\n", j);
+						}
+					}
 				}
+				int missing_count = 0;
+				for(int k = 0 ; k < original.data_sz; k++) {
+						int found = shivang_binary_serach(original.shivang_data[k]);
+						if ( ! found) {
+							printf("missing page : %lld\n", original.shivang_data[k]);
+							missing_count++;
+						}
+				}
+				printf("missing count: %d\n" , missing_count);
 				goto finish;
 			}
 			/*
@@ -8992,6 +9099,8 @@ write_kdump_pages_parallel_cyclic(struct cache_data *cd_header,
 		}
 		info->page_flag_buf[consuming]->ready = FLAG_UNUSED;
 		info->page_flag_buf[consuming] = info->page_flag_buf[consuming]->next;
+		// printf("num_dumped: %d, total_dumpable: %d\n", num_dumped, info->num_dumpable);
+		// printf("total_counted : %d\n" , shivang_counter);
 	}
 finish:
 	ret = TRUE;
